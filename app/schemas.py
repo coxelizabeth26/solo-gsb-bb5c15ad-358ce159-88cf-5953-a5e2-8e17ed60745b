@@ -35,6 +35,47 @@ class SubscriptionOut(BaseModel):
     state: str  # circuit breaker: 'closed' | 'open' | 'half_open'
     consecutive_failures: int
     next_probe_at: str | None  # set only while the breaker is open
+    # Token-bucket rate policy; nulls mean no rate limit is configured.
+    rate_per_second: float | None
+    burst: float | None
+
+
+class RatePolicyCreate(BaseModel):
+    """Body of PUT /subscriptions/{id}/rate-policy.
+
+    rate_per_second is the sustained delivery rate (tokens added per
+    second, may be fractional, e.g. 0.5 = one delivery every 2 seconds);
+    burst is the token-bucket capacity and thus the maximum burst of
+    deliveries that can fire back-to-back. When burst is omitted it
+    defaults to one second worth of tokens (at least 1). Installing a
+    policy resets the bucket to full; use DELETE to remove it.
+    """
+
+    rate_per_second: float = Field(gt=0, le=1_000_000)
+    burst: float | None = Field(default=None, gt=0, le=1_000_000)
+
+    @field_validator("burst")
+    @classmethod
+    def _burst_is_at_least_one(cls, v: float | None) -> float | None:
+        if v is not None and v < 1.0:
+            raise ValueError("burst must be at least 1")
+        return v
+
+
+class RatePolicyOut(BaseModel):
+    """Response of GET/PUT /subscriptions/{id}/rate-policy.
+
+    enabled is False (and the numeric fields null) only when no policy is
+    configured. tokens_available is the bucket balance refilled lazily to
+    the query instant; next_token_at is the earliest time a whole token is
+    available (null when one already is, or while limited is False).
+    """
+
+    enabled: bool
+    rate_per_second: float | None
+    burst: float | None
+    tokens_available: float | None
+    next_token_at: str | None
 
 
 class SecretRotationCreate(BaseModel):

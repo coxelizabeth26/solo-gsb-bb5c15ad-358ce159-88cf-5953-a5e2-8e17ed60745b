@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -25,7 +26,11 @@ CREATE TABLE IF NOT EXISTS subscriptions (
                                  CHECK (breaker_state IN ('closed', 'open', 'half_open')),
     breaker_consecutive_failures INTEGER NOT NULL DEFAULT 0,
     breaker_next_probe_at        REAL,  -- epoch seconds when an open breaker allows its probe
-    breaker_probe_task_id        INTEGER -- the single half-open probe task; NULL unless half_open
+    breaker_probe_task_id        INTEGER, -- the single half-open probe task; NULL unless half_open
+    rate_capacity          REAL,        -- token-bucket size (max burst); NULL = rate limiting off
+    rate_refill_per_second REAL,        -- tokens added per second (sustained delivery rate)
+    rate_tokens            REAL,        -- persisted balance; refilled lazily by wall clock
+    rate_updated_at        REAL         -- epoch seconds the balance was last persisted
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -80,8 +85,35 @@ CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts (task_id);
 # Columns returned to the API layer for a subscription (never secret material).
 _SUB_COLUMNS = (
     "id, target_url, created_at, paused_at, previous_secret_expires_at, "
-    "breaker_state, breaker_consecutive_failures, breaker_next_probe_at"
+    "breaker_state, breaker_consecutive_failures, breaker_next_probe_at, "
+    "rate_capacity, rate_refill_per_second, rate_tokens, rate_updated_at"
 )
+
+# Token accounting tolerance; avoids rescheduling by microseconds due to
+# floating-point round-off when a token is effectively already available.
+_TOKEN_EPS = 1e-9
+
+
+def _refill_tokens(
+    capacity: float,
+    refill_per_second: float,
+    tokens: float | None,
+    updated_at: float | None,
+    now: float,
+) -> tuple[float, float]:
+    """Lazy token-bucket refill against the wall clock.
+
+    Returns (balance, balance_timestamp). Rows created before the rate
+    columns existed (or before a policy was installed) have no balance
+    state; they start with a full bucket stamped at 'now'. Otherwise the
+    balance grows linearly at refill_per_second, capped at capacity.
+    """
+    if tokens is None or updated_at is None:
+        return capacity, now
+    if now <= updated_at:
+        return tokens, updated_at
+    balance = min(capacity, tokens + (now - updated_at) * refill_per_second)
+    return balance, now
 
 
 class Database:
@@ -97,10 +129,34 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # When several worker *processes* share the database file, an
+        # IMMEDIATE write lock can momentarily be held by another connection;
+        # wait for it instead of failing instantly with SQLITE_BUSY.
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._migrate()
+            self._conn.commit()
+
+    @contextmanager
+    def _immediate(self):
+        """Open a write transaction that takes the database write lock at once.
+
+        BEGIN IMMEDIATE acquires SQLite's reserved (then pending) lock before
+        any row is read, so the SELECT-then-UPDATE claim sequence is
+        serialized not only by the in-process threading lock but also across
+        separate connections/processes sharing the file: a second claim waits
+        on busy_timeout until the first commits and then reads the updated
+        state, never double-spending a token or claiming the same task.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        else:
             self._conn.commit()
 
     def _migrate(self) -> None:
@@ -138,6 +194,22 @@ class Database:
         if "breaker_probe_task_id" not in cols:
             self._conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN breaker_probe_task_id INTEGER"
+            )
+        if "rate_capacity" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN rate_capacity REAL"
+            )
+        if "rate_refill_per_second" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN rate_refill_per_second REAL"
+            )
+        if "rate_tokens" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN rate_tokens REAL"
+            )
+        if "rate_updated_at" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN rate_updated_at REAL"
             )
 
         task_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)")}
@@ -222,12 +294,11 @@ class Database:
     def create_subscription(self, target_url: str, secret: str) -> dict:
         sub_id = uuid.uuid4().hex[:12]
         now = time.time()
-        with self._lock:
+        with self._lock, self._immediate():
             self._conn.execute(
                 "INSERT INTO subscriptions (id, target_url, secret, created_at) VALUES (?, ?, ?, ?)",
                 (sub_id, target_url, secret, now),
             )
-            self._conn.commit()
         return {
             "id": sub_id,
             "target_url": target_url,
@@ -237,6 +308,10 @@ class Database:
             "breaker_state": "closed",
             "breaker_consecutive_failures": 0,
             "breaker_next_probe_at": None,
+            "rate_capacity": None,
+            "rate_refill_per_second": None,
+            "rate_tokens": None,
+            "rate_updated_at": None,
         }
 
     def list_subscriptions(self) -> list[dict]:
@@ -264,7 +339,7 @@ class Database:
         paused_at timestamp. Returns the updated row, or None when the
         subscription does not exist.
         """
-        with self._lock:
+        with self._lock, self._immediate():
             row = self._conn.execute(
                 "SELECT paused_at FROM subscriptions WHERE id = ?", (sub_id,)
             ).fetchone()
@@ -279,7 +354,6 @@ class Database:
                 self._conn.execute(
                     "UPDATE subscriptions SET paused_at = NULL WHERE id = ?", (sub_id,)
                 )
-            self._conn.commit()
             row = self._conn.execute(
                 f"SELECT {_SUB_COLUMNS} FROM subscriptions WHERE id = ?",
                 (sub_id,),
@@ -303,7 +377,7 @@ class Database:
         the row never contains secret material.
         """
         now = time.time()
-        with self._lock:
+        with self._lock, self._immediate():
             row = self._conn.execute(
                 "SELECT secret, previous_secret_expires_at FROM subscriptions WHERE id = ?",
                 (sub_id,),
@@ -325,12 +399,108 @@ class Database:
                     (new_secret, previous, previous_expires, sub_id),
                 )
                 status = "rotated"
-            self._conn.commit()
             row = self._conn.execute(
                 f"SELECT {_SUB_COLUMNS} FROM subscriptions WHERE id = ?",
                 (sub_id,),
             ).fetchone()
         return status, dict(row)
+
+    # ------------------------------------------------------------------
+    # per-subscription token-bucket rate policy
+    # ------------------------------------------------------------------
+    def set_rate_policy(
+        self, sub_id: str, capacity: float, refill_per_second: float
+    ) -> dict | None:
+        """Install/replace a subscription's rate policy, atomically.
+
+        The bucket is reset full (rate_tokens = capacity) with the balance
+        timestamp set to now, so the new policy starts with its whole burst
+        available. Existing task schedules are never rewritten: pending
+        tasks simply run into the new bucket state on their next claim
+        attempt (a head task whose next_attempt_at is due but whose bucket
+        is empty gets rescheduled to the exact refill instant). Returns the
+        resulting policy state, or None when the subscription does not exist.
+        """
+        now = time.time()
+        with self._lock, self._immediate():
+            row = self._conn.execute(
+                "SELECT 1 FROM subscriptions WHERE id = ?", (sub_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                """UPDATE subscriptions
+                      SET rate_capacity = ?, rate_refill_per_second = ?,
+                          rate_tokens = ?, rate_updated_at = ?
+                    WHERE id = ?""",
+                (capacity, refill_per_second, capacity, now, sub_id),
+            )
+            row = self._conn.execute(
+                f"SELECT {_SUB_COLUMNS} FROM subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+        return dict(row)
+
+    def get_rate_policy(self, sub_id: str) -> dict | None:
+        """Return the subscription's rate policy with its live bucket state.
+
+        The stored balance is refilled lazily against the wall clock for
+        display (the persisted row is not modified): tokens = min(capacity,
+        stored + refill * elapsed), and next_token_at is the earliest time at
+        which one whole token will be available (None when already
+        available, or when no policy is configured). Returns None when the
+        subscription does not exist; enabled fields are None while limited
+        is False.
+        """
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {_SUB_COLUMNS} FROM subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        sub = dict(row)
+        capacity = sub["rate_capacity"]
+        refill = sub["rate_refill_per_second"]
+        if capacity is None or refill is None:
+            return {
+                "rate_per_second": None,
+                "burst": None,
+                "tokens_available": None,
+                "next_token_at": None,
+            }
+        tokens, _ = _refill_tokens(
+            capacity, refill, sub["rate_tokens"], sub["rate_updated_at"], now
+        )
+        if tokens >= 1.0:
+            next_token_at = None
+        else:
+            next_token_at = now + (1.0 - tokens) / refill
+        return {
+            "rate_per_second": refill,
+            "burst": capacity,
+            "tokens_available": tokens,
+            "next_token_at": next_token_at,
+        }
+
+    def delete_rate_policy(self, sub_id: str) -> bool:
+        """Remove a subscription's rate policy (rate limiting off).
+
+        The bucket columns are cleared; task rows are not touched, so any
+        task previously rescheduled for a refill wakes as scheduled (or
+        sooner if another path already moved it) and then claims without a
+        token check. Returns False when the subscription does not exist.
+        """
+        with self._lock, self._immediate():
+            cur = self._conn.execute(
+                """UPDATE subscriptions
+                      SET rate_capacity = NULL, rate_refill_per_second = NULL,
+                          rate_tokens = NULL, rate_updated_at = NULL
+                    WHERE id = ? AND rate_capacity IS NOT NULL""",
+                (sub_id,),
+            )
+        return cur.rowcount > 0
 
     def subscription_exists(self, sub_id: str) -> bool:
         with self._lock:
@@ -340,9 +510,8 @@ class Database:
         return row is not None
 
     def delete_subscription(self, sub_id: str) -> bool:
-        with self._lock:
+        with self._lock, self._immediate():
             cur = self._conn.execute("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
-            self._conn.commit()
         return cur.rowcount > 0
 
     # ------------------------------------------------------------------
@@ -356,12 +525,11 @@ class Database:
         return row["payload"] if row else None
 
     def create_event(self, event_id: str, payload: str) -> None:
-        with self._lock:
+        with self._lock, self._immediate():
             self._conn.execute(
                 "INSERT INTO events (id, payload, created_at) VALUES (?, ?, ?)",
                 (event_id, payload, time.time()),
             )
-            self._conn.commit()
 
     def create_task(
         self,
@@ -382,7 +550,7 @@ class Database:
         """
         now = time.time()
         due = deliver_at if deliver_at is not None else now
-        with self._lock:
+        with self._lock, self._immediate():
             cur = self._conn.execute(
                 """INSERT OR IGNORE INTO tasks
                        (event_id, subscription_id, status, attempts, max_attempts,
@@ -395,7 +563,6 @@ class Database:
                 "SELECT * FROM tasks WHERE event_id = ? AND subscription_id = ?",
                 (event_id, subscription_id),
             ).fetchone()
-            self._conn.commit()
         return dict(row), created
 
     def ingest_event(
@@ -418,7 +585,7 @@ class Database:
             ("created", receipt_dict)    -- first acceptance; tasks were created
         """
         now = time.time()
-        with self._lock:
+        with self._lock, self._immediate():
             row = self._conn.execute(
                 "SELECT raw_body, receipt FROM ingested_events WHERE id = ?",
                 (webhook_id,),
@@ -481,7 +648,6 @@ class Database:
                 "INSERT INTO ingested_events (id, raw_body, receipt, created_at) VALUES (?, ?, ?, ?)",
                 (webhook_id, raw_body, json.dumps(receipt), now),
             )
-            self._conn.commit()
         return "created", receipt
 
     def claim_due_task(self, worker_id: str, now: float) -> dict | None:
@@ -528,52 +694,146 @@ class Database:
         recorded as the single probe. While 'half_open', only the probe
         task itself can be claimed (e.g. for its retries); every other
         task of the subscription waits for the probe's verdict.
+
+        Per-subscription token bucket: when a subscription has a rate
+        policy (rate_capacity / rate_refill_per_second set), the candidate
+        task -- which the ordering rule guarantees is the subscription's
+        head task -- is admitted only after a token is deducted. The
+        balance is refilled lazily against the wall clock and refilled,
+        checked, deducted and persisted inside this same locked critical
+        section, so concurrent workers can never spend the same token and
+        the balance survives restarts. With no whole token available the
+        task is NOT claimed: it stays 'pending' and its next_attempt_at is
+        pushed to the exact, deterministically computed instant the next
+        token arrives (now + (1 - balance) / refill); the refilled balance
+        is persisted in the same commit. Because only the head task is
+        ever considered and later tasks of the subscription are blocked by
+        the ordering NOT EXISTS anyway, rescheduling it preserves strict
+        per-subscription order. The claim loop then looks for due work of
+        other subscriptions, so one throttled subscription never parks an
+        idle worker. A subscription found throttled during this call is
+        skipped for the rest of the same call (it is recorded in
+        throttled_sids): its head task was pushed to its refill instant
+        once, and considering it again would only push that instant out
+        further while examining tasks that are blocked behind it anyway.
         """
         with self._lock:
-            row = self._conn.execute(
-                """SELECT t.*, s.target_url, s.secret, s.previous_secret,
-                          s.previous_secret_expires_at, s.breaker_state, e.payload
-                   FROM tasks t
-                   LEFT JOIN subscriptions s ON s.id = t.subscription_id
-                   LEFT JOIN events e ON e.id = t.event_id
-                   WHERE t.status = 'pending' AND t.next_attempt_at <= ?
-                     AND s.paused_at IS NULL
-                     AND (
-                           s.id IS NULL              -- subscription deleted: claim and fail
-                           OR s.breaker_state = 'closed'
-                           OR (s.breaker_state = 'open' AND s.breaker_next_probe_at <= ?)
-                           OR (s.breaker_state = 'half_open'
-                               AND t.id = s.breaker_probe_task_id)
-                         )
-                     AND NOT EXISTS (
-                           SELECT 1 FROM tasks earlier
-                           WHERE earlier.subscription_id = t.subscription_id
-                             AND earlier.id < t.id
-                             AND earlier.status IN ('pending', 'in_progress')
-                         )
-                   ORDER BY t.next_attempt_at, t.id
-                   LIMIT 1""",
-                (now, now),
-            ).fetchone()
-            if row is None:
-                return None
-            self._conn.execute(
-                "UPDATE tasks SET status = 'in_progress', claimed_by = ?, updated_at = ? WHERE id = ?",
-                (worker_id, now, row["id"]),
-            )
-            if row["breaker_state"] == "open":
-                # Cooldown elapsed: this claim is the subscription's single
-                # half-open probe. The state flip is committed together with
-                # the claim, so no second worker can also become the probe.
-                self._conn.execute(
-                    """UPDATE subscriptions
-                       SET breaker_state = 'half_open', breaker_probe_task_id = ?,
-                           breaker_next_probe_at = NULL
-                       WHERE id = ? AND breaker_state = 'open'""",
-                    (row["id"], row["subscription_id"]),
-                )
-            self._conn.commit()
-        return dict(row)
+            # Take the database-wide write lock up front (BEGIN IMMEDIATE)
+            # so the eligibility SELECT, the token deduction and the claim
+            # UPDATE are one indivisible database-level critical section,
+            # also across separate worker processes. An entirely idle poll
+            # performs no writes and is rolled back, which costs no fsync.
+            self._conn.execute("BEGIN IMMEDIATE")
+            dirty = False
+            try:
+                # Reschedule each throttled subscription at most once per
+                # call; the membership check also makes the loop provably
+                # terminate (it never revisits a subscription it deferred).
+                throttled_sids: set[str] = set()
+                while True:
+                    skip = ",".join("?" * len(throttled_sids)) if throttled_sids else "SELECT NULL WHERE 0"
+                    row = self._conn.execute(
+                        f"""SELECT t.*, s.target_url, s.secret, s.previous_secret,
+                                  s.previous_secret_expires_at, s.breaker_state,
+                                  s.rate_capacity, s.rate_refill_per_second,
+                                  s.rate_tokens, s.rate_updated_at, e.payload
+                           FROM tasks t
+                           LEFT JOIN subscriptions s ON s.id = t.subscription_id
+                           LEFT JOIN events e ON e.id = t.event_id
+                           WHERE t.status = 'pending' AND t.next_attempt_at <= ?
+                             AND s.paused_at IS NULL
+                             AND (s.id IS NULL OR t.subscription_id NOT IN ({skip}))
+                             AND (
+                                   s.id IS NULL              -- subscription deleted: claim and fail
+                                   OR s.breaker_state = 'closed'
+                                   OR (s.breaker_state = 'open' AND s.breaker_next_probe_at <= ?)
+                                   OR (s.breaker_state = 'half_open'
+                                       AND t.id = s.breaker_probe_task_id)
+                                 )
+                             AND NOT EXISTS (
+                                   SELECT 1 FROM tasks earlier
+                                   WHERE earlier.subscription_id = t.subscription_id
+                                     AND earlier.id < t.id
+                                     AND earlier.status IN ('pending', 'in_progress')
+                                 )
+                           ORDER BY t.next_attempt_at, t.id
+                           LIMIT 1""",
+                        (now, *throttled_sids, now) if throttled_sids else (now, now),
+                    ).fetchone()
+                    if row is None:
+                        if dirty:
+                            self._conn.commit()  # persist throttled reschedules only
+                        else:
+                            self._conn.execute("ROLLBACK")  # idle poll: no fsync
+                        return None
+
+                    capacity = row["rate_capacity"]
+                    refill = row["rate_refill_per_second"]
+                    if capacity is not None and refill is not None and row["target_url"] is not None:
+                        # Lazy refill persisted in the same critical section as
+                        # the claim, so the bucket is shared consistently across
+                        # workers and across restarts.
+                        balance, _ = _refill_tokens(
+                            capacity,
+                            refill,
+                            row["rate_tokens"],
+                            row["rate_updated_at"],
+                            now,
+                        )
+                        if balance < 1.0 - _TOKEN_EPS:
+                            # No token: the head task stays pending until the
+                            # missing fraction of a token has accrued. The
+                            # instant is a pure function of the persisted
+                            # balance, so every worker computes the same time.
+                            available_at = now + (1.0 - balance) / refill
+                            self._conn.execute(
+                                """UPDATE tasks
+                                      SET next_attempt_at = ?, updated_at = ?
+                                    WHERE id = ? AND status = 'pending'""",
+                                (available_at, now, row["id"]),
+                            )
+                            self._conn.execute(
+                                """UPDATE subscriptions
+                                      SET rate_tokens = ?, rate_updated_at = ?
+                                    WHERE id = ?""",
+                                (balance, now, row["subscription_id"]),
+                            )
+                            # The throttled head task blocks only its own
+                            # subscription; remember it and re-query for work of
+                            # other subscriptions. The reschedule commits once
+                            # the claim transaction leaves the loop.
+                            throttled_sids.add(row["subscription_id"])
+                            dirty = True
+                            continue
+                        # Atomically spend one token together with the claim.
+                        self._conn.execute(
+                            """UPDATE subscriptions
+                                  SET rate_tokens = ?, rate_updated_at = ?
+                                WHERE id = ?""",
+                            (balance - 1.0, now, row["subscription_id"]),
+                        )
+
+                    self._conn.execute(
+                        "UPDATE tasks SET status = 'in_progress', claimed_by = ?, updated_at = ? WHERE id = ?",
+                        (worker_id, now, row["id"]),
+                    )
+                    if row["breaker_state"] == "open":
+                        # Cooldown elapsed: this claim is the subscription's
+                        # single half-open probe. The state flip is committed
+                        # together with the claim, so no second worker can
+                        # also become the probe.
+                        self._conn.execute(
+                            """UPDATE subscriptions
+                               SET breaker_state = 'half_open', breaker_probe_task_id = ?,
+                                   breaker_next_probe_at = NULL
+                               WHERE id = ? AND breaker_state = 'open'""",
+                            (row["id"], row["subscription_id"]),
+                        )
+                    self._conn.commit()
+                    return dict(row)
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def finish_attempt(
         self,
@@ -592,7 +852,7 @@ class Database:
         the same transaction, so the failure count and the state machine can
         never drift apart from the task history.
         """
-        with self._lock:
+        with self._lock, self._immediate():
             self._conn.execute(
                 """INSERT INTO attempts (task_id, attempt_no, status_code, error, started_at, finished_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
@@ -613,7 +873,6 @@ class Database:
                     (outcome, outcome, attempt_no, status_code, error, finished_at, task_id),
                 )
                 self._apply_breaker_outcome(task_id, outcome, finished_at)
-            self._conn.commit()
 
     def _apply_breaker_outcome(self, task_id: int, outcome: str, now: float) -> None:
         """Advance the circuit breaker of the task's subscription.
@@ -686,13 +945,12 @@ class Database:
         like any other pending task; otherwise it is redelivered.
         """
         now = time.time()
-        with self._lock:
+        with self._lock, self._immediate():
             cur = self._conn.execute(
                 """UPDATE tasks SET status = 'pending', next_attempt_at = ?, claimed_by = NULL, updated_at = ?
                    WHERE status = 'in_progress'""",
                 (now, now),
             )
-            self._conn.commit()
         return cur.rowcount
 
     def event_status(self, event_id: str) -> dict | None:
@@ -836,7 +1094,7 @@ class Database:
         None when the event does not exist.
         """
         now = time.time()
-        with self._lock:
+        with self._lock, self._immediate():
             exists = self._conn.execute(
                 "SELECT 1 FROM events WHERE id = ?", (event_id,)
             ).fetchone()
@@ -881,7 +1139,6 @@ class Database:
             }
             for r in rows:
                 counts[r["status"]] = r["n"]
-            self._conn.commit()
 
         return {
             "event_id": event_id,

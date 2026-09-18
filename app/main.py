@@ -25,6 +25,8 @@ from .schemas import (
     EventCreate,
     EventStatus,
     IngestEvent,
+    RatePolicyCreate,
+    RatePolicyOut,
     SecretRotationCreate,
     SubscriptionCreate,
     SubscriptionOut,
@@ -114,6 +116,20 @@ def _sub_out(sub: dict) -> dict:
         "state": sub["breaker_state"],
         "consecutive_failures": sub["breaker_consecutive_failures"],
         "next_probe_at": _iso(sub["breaker_next_probe_at"]),
+        "rate_per_second": sub.get("rate_refill_per_second"),
+        "burst": sub.get("rate_capacity"),
+    }
+
+
+def _rate_policy_out(policy: dict) -> dict:
+    """Serialize a rate-policy row (from db.get_rate_policy) for the API."""
+    enabled = policy["rate_per_second"] is not None
+    return {
+        "enabled": enabled,
+        "rate_per_second": policy["rate_per_second"] if enabled else None,
+        "burst": policy["burst"] if enabled else None,
+        "tokens_available": round(policy["tokens_available"], 6) if enabled else None,
+        "next_token_at": _iso(policy["next_token_at"]),
     }
 
 
@@ -228,6 +244,56 @@ def rotate_subscription_secret(sub_id: str, body: SecretRotationCreate) -> dict:
         raise HTTPException(409, f"a secret rotation is already in progress until {until}")
     log.info("subscription %s rotated signing secret (grace %.0fs)", sub_id, body.grace_seconds)
     return _sub_out(sub)
+
+
+@app.put("/subscriptions/{sub_id}/rate-policy", response_model=RatePolicyOut)
+def put_rate_policy(sub_id: str, body: RatePolicyCreate) -> dict:
+    """Install or replace a subscription's token-bucket rate policy.
+
+    rate_per_second is the sustained rate (fractional allowed, e.g. 0.5
+    for one delivery every two seconds); burst is the bucket capacity,
+    defaulting to one second worth of tokens. The bucket starts full, so a
+    freshly configured subscription may immediately send up to 'burst'
+    deliveries back-to-back. Claiming deducts a token atomically inside the
+    worker's database critical section; when no token is available the head
+    task stays pending until the deterministically scheduled refill. The
+    bucket state is persisted, so it stays consistent across restarts and
+    across concurrent workers.
+    """
+    burst = body.burst if body.burst is not None else max(1.0, body.rate_per_second)
+    sub = app.state.db.set_rate_policy(sub_id, burst, body.rate_per_second)
+    if sub is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    # The bucket was just reset full with its timestamp stamped to now, so
+    # its live view is derivable directly from the returned row.
+    policy = {
+        "rate_per_second": sub["rate_refill_per_second"],
+        "burst": sub["rate_capacity"],
+        "tokens_available": sub["rate_tokens"],
+        "next_token_at": None,
+    }
+    log.info(
+        "subscription %s rate policy set: %s tokens/s, burst %s",
+        sub_id, body.rate_per_second, burst,
+    )
+    return _rate_policy_out(policy)
+
+
+@app.get("/subscriptions/{sub_id}/rate-policy", response_model=RatePolicyOut)
+def get_rate_policy(sub_id: str) -> dict:
+    """Return the subscription's rate policy and its live bucket state."""
+    policy = app.state.db.get_rate_policy(sub_id)
+    if policy is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return _rate_policy_out(policy)
+
+
+@app.delete("/subscriptions/{sub_id}/rate-policy", status_code=204)
+def delete_rate_policy(sub_id: str) -> Response:
+    """Remove a subscription's rate policy (rate limiting disabled)."""
+    if not app.state.db.delete_rate_policy(sub_id):
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return Response(status_code=204)
 
 
 # ----------------------------------------------------------------------
