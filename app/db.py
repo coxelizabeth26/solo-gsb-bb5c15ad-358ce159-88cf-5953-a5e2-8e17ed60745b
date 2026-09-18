@@ -25,7 +25,11 @@ CREATE TABLE IF NOT EXISTS subscriptions (
                                  CHECK (breaker_state IN ('closed', 'open', 'half_open')),
     breaker_consecutive_failures INTEGER NOT NULL DEFAULT 0,
     breaker_next_probe_at        REAL,  -- epoch seconds when an open breaker allows its probe
-    breaker_probe_task_id        INTEGER -- the single half-open probe task; NULL unless half_open
+    breaker_probe_task_id        INTEGER, -- the single half-open probe task; NULL unless half_open
+    rate_limit_per_second        REAL,  -- token refill rate (tokens/second); NULL = unlimited
+    rate_limit_burst             REAL,  -- bucket capacity (max accumulated tokens)
+    rate_limit_tokens            REAL,  -- token balance at the last settlement
+    rate_limit_updated_at        REAL   -- epoch seconds of the last token settlement
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -138,6 +142,24 @@ class Database:
         if "breaker_probe_task_id" not in cols:
             self._conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN breaker_probe_task_id INTEGER"
+            )
+        # Per-subscription token-bucket rate limiting. All four columns stay
+        # NULL together (the default) while a subscription is unlimited.
+        if "rate_limit_per_second" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN rate_limit_per_second REAL"
+            )
+        if "rate_limit_burst" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN rate_limit_burst REAL"
+            )
+        if "rate_limit_tokens" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN rate_limit_tokens REAL"
+            )
+        if "rate_limit_updated_at" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN rate_limit_updated_at REAL"
             )
 
         task_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)")}
@@ -346,6 +368,106 @@ class Database:
         return cur.rowcount > 0
 
     # ------------------------------------------------------------------
+    # per-subscription rate limiting (token bucket)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _rate_limit_status(row: sqlite3.Row, now: float) -> dict:
+        """Shape a subscription row's rate-limit columns for the API layer.
+
+        The reported token balance is settled lazily up to `now` (read-only;
+        the persisted columns are only ever written inside the claim critical
+        section or when the policy itself changes).
+        """
+        rate = row["rate_limit_per_second"]
+        if rate is None:
+            return {
+                "limited": False,
+                "rate_per_second": None,
+                "burst": None,
+                "tokens": None,
+                "retry_after_seconds": None,
+                "updated_at": None,
+            }
+        tokens = min(
+            row["rate_limit_burst"],
+            row["rate_limit_tokens"] + (now - row["rate_limit_updated_at"]) * rate,
+        )
+        return {
+            "limited": True,
+            "rate_per_second": rate,
+            "burst": int(row["rate_limit_burst"]),
+            "tokens": tokens,
+            # Seconds until one full token is available (0 when the bucket
+            # already holds one); mirrors the deferral computed at claim time.
+            "retry_after_seconds": max(0.0, (1.0 - tokens) / rate),
+            "updated_at": row["rate_limit_updated_at"],
+        }
+
+    def get_rate_limit(self, sub_id: str) -> dict | None:
+        """Current rate-limit policy and live token balance of a subscription.
+
+        Returns None when the subscription does not exist.
+        """
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT rate_limit_per_second, rate_limit_burst,
+                          rate_limit_tokens, rate_limit_updated_at
+                   FROM subscriptions WHERE id = ?""",
+                (sub_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._rate_limit_status(row, now)
+
+    def set_rate_limit(self, sub_id: str, rate: float, burst: int) -> dict | None:
+        """Create or replace a subscription's token-bucket policy, atomically.
+
+        The bucket always (re)starts full: tokens = burst, settled at the
+        moment of the write. Replacing an existing policy therefore also
+        refills the bucket. Returns the resulting status, or None when the
+        subscription does not exist.
+        """
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE subscriptions
+                   SET rate_limit_per_second = ?, rate_limit_burst = ?,
+                       rate_limit_tokens = ?, rate_limit_updated_at = ?
+                   WHERE id = ?""",
+                (rate, float(burst), float(burst), now, sub_id),
+            )
+            self._conn.commit()
+            if cur.rowcount == 0:
+                return None
+            row = self._conn.execute(
+                """SELECT rate_limit_per_second, rate_limit_burst,
+                          rate_limit_tokens, rate_limit_updated_at
+                   FROM subscriptions WHERE id = ?""",
+                (sub_id,),
+            ).fetchone()
+        return self._rate_limit_status(row, now)
+
+    def delete_rate_limit(self, sub_id: str) -> bool:
+        """Remove a subscription's rate-limit policy (idempotent).
+
+        All four columns are cleared together; already-deferred pending tasks
+        keep their stored next_attempt_at and simply become claimable at that
+        (already computed) time without any further token cost. Returns False
+        when the subscription does not exist.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE subscriptions
+                   SET rate_limit_per_second = NULL, rate_limit_burst = NULL,
+                       rate_limit_tokens = NULL, rate_limit_updated_at = NULL
+                   WHERE id = ?""",
+                (sub_id,),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
     # events and tasks
     # ------------------------------------------------------------------
     def get_event_payload(self, event_id: str) -> str | None:
@@ -528,52 +650,111 @@ class Database:
         recorded as the single probe. While 'half_open', only the probe
         task itself can be claimed (e.g. for its retries); every other
         task of the subscription waits for the probe's verdict.
+
+        Token-bucket rate limiting: when the subscription has a rate-limit
+        policy (rate_limit_per_second not NULL), claiming consumes one
+        token from its persisted bucket. The bucket is settled lazily
+        inside this same critical section -- tokens = min(burst, tokens +
+        elapsed * rate) -- and the deduction commits together with the
+        claim, so concurrent workers can never spend the same token and
+        the balance survives restarts. When the bucket holds less than one
+        token the task is NOT claimed: it stays 'pending' and its
+        next_attempt_at is moved to the computable refill instant
+        now + (1 - tokens) / rate, so every worker skips it until a token
+        is available again (the settled balance is persisted in the same
+        commit). The loop then considers the next-due task, so other
+        subscriptions keep flowing. Deferral never reorders a
+        subscription's tasks: the deferred task remains the earliest
+        pending one and keeps blocking its successors via the ordering
+        rule above.
         """
         with self._lock:
-            row = self._conn.execute(
-                """SELECT t.*, s.target_url, s.secret, s.previous_secret,
-                          s.previous_secret_expires_at, s.breaker_state, e.payload
-                   FROM tasks t
-                   LEFT JOIN subscriptions s ON s.id = t.subscription_id
-                   LEFT JOIN events e ON e.id = t.event_id
-                   WHERE t.status = 'pending' AND t.next_attempt_at <= ?
-                     AND s.paused_at IS NULL
-                     AND (
-                           s.id IS NULL              -- subscription deleted: claim and fail
-                           OR s.breaker_state = 'closed'
-                           OR (s.breaker_state = 'open' AND s.breaker_next_probe_at <= ?)
-                           OR (s.breaker_state = 'half_open'
-                               AND t.id = s.breaker_probe_task_id)
-                         )
-                     AND NOT EXISTS (
-                           SELECT 1 FROM tasks earlier
-                           WHERE earlier.subscription_id = t.subscription_id
-                             AND earlier.id < t.id
-                             AND earlier.status IN ('pending', 'in_progress')
-                         )
-                   ORDER BY t.next_attempt_at, t.id
-                   LIMIT 1""",
-                (now, now),
-            ).fetchone()
-            if row is None:
-                return None
-            self._conn.execute(
-                "UPDATE tasks SET status = 'in_progress', claimed_by = ?, updated_at = ? WHERE id = ?",
-                (worker_id, now, row["id"]),
-            )
-            if row["breaker_state"] == "open":
-                # Cooldown elapsed: this claim is the subscription's single
-                # half-open probe. The state flip is committed together with
-                # the claim, so no second worker can also become the probe.
+            while True:
+                row = self._conn.execute(
+                    """SELECT t.*, s.target_url, s.secret, s.previous_secret,
+                              s.previous_secret_expires_at, s.breaker_state,
+                              s.rate_limit_per_second, s.rate_limit_burst,
+                              s.rate_limit_tokens, s.rate_limit_updated_at,
+                              e.payload
+                       FROM tasks t
+                       LEFT JOIN subscriptions s ON s.id = t.subscription_id
+                       LEFT JOIN events e ON e.id = t.event_id
+                       WHERE t.status = 'pending' AND t.next_attempt_at <= ?
+                         AND s.paused_at IS NULL
+                         AND (
+                               s.id IS NULL              -- subscription deleted: claim and fail
+                               OR s.breaker_state = 'closed'
+                               OR (s.breaker_state = 'open' AND s.breaker_next_probe_at <= ?)
+                               OR (s.breaker_state = 'half_open'
+                                   AND t.id = s.breaker_probe_task_id)
+                             )
+                         AND NOT EXISTS (
+                               SELECT 1 FROM tasks earlier
+                               WHERE earlier.subscription_id = t.subscription_id
+                                 AND earlier.id < t.id
+                                 AND earlier.status IN ('pending', 'in_progress')
+                             )
+                       ORDER BY t.next_attempt_at, t.id
+                       LIMIT 1""",
+                    (now, now),
+                ).fetchone()
+                if row is None:
+                    self._conn.commit()  # persist any deferrals made this round
+                    return None
+
+                rate = row["rate_limit_per_second"]
+                if rate is not None:
+                    # Settle the persisted bucket up to this instant, then
+                    # try to spend one token on this claim.
+                    tokens = min(
+                        row["rate_limit_burst"],
+                        row["rate_limit_tokens"]
+                        + (now - row["rate_limit_updated_at"]) * rate,
+                    )
+                    if tokens < 1.0:
+                        # Bucket empty: keep the task 'pending' and defer it
+                        # to the exact instant one token will have refilled.
+                        retry_at = now + (1.0 - tokens) / rate
+                        self._conn.execute(
+                            """UPDATE subscriptions
+                               SET rate_limit_tokens = ?, rate_limit_updated_at = ?
+                               WHERE id = ?""",
+                            (tokens, now, row["subscription_id"]),
+                        )
+                        self._conn.execute(
+                            """UPDATE tasks SET next_attempt_at = ?, updated_at = ?
+                               WHERE id = ?""",
+                            (retry_at, now, row["id"]),
+                        )
+                        self._conn.commit()
+                        # The deferral moved the task past `now`, so the next
+                        # iteration cannot select it again; the loop always
+                        # terminates.
+                        continue
+                    self._conn.execute(
+                        """UPDATE subscriptions
+                           SET rate_limit_tokens = ?, rate_limit_updated_at = ?
+                           WHERE id = ?""",
+                        (tokens - 1.0, now, row["subscription_id"]),
+                    )
+
                 self._conn.execute(
-                    """UPDATE subscriptions
-                       SET breaker_state = 'half_open', breaker_probe_task_id = ?,
-                           breaker_next_probe_at = NULL
-                       WHERE id = ? AND breaker_state = 'open'""",
-                    (row["id"], row["subscription_id"]),
+                    "UPDATE tasks SET status = 'in_progress', claimed_by = ?, updated_at = ? WHERE id = ?",
+                    (worker_id, now, row["id"]),
                 )
-            self._conn.commit()
-        return dict(row)
+                if row["breaker_state"] == "open":
+                    # Cooldown elapsed: this claim is the subscription's single
+                    # half-open probe. The state flip is committed together with
+                    # the claim, so no second worker can also become the probe.
+                    self._conn.execute(
+                        """UPDATE subscriptions
+                           SET breaker_state = 'half_open', breaker_probe_task_id = ?,
+                               breaker_next_probe_at = NULL
+                           WHERE id = ? AND breaker_state = 'open'""",
+                        (row["id"], row["subscription_id"]),
+                    )
+                self._conn.commit()
+                return dict(row)
 
     def finish_attempt(
         self,

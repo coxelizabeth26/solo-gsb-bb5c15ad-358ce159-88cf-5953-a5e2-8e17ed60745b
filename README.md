@@ -8,6 +8,7 @@
 - **订阅暂停/恢复**：`POST /subscriptions/{id}/pause` 暂停后不再领取该订阅的新任务（已 `in_progress` 的尝试正常完成），暂停期间提交的事件照常入库并保持 `pending`；`/resume` 恢复后按原 `next_attempt_at` 与 `task_id` 顺序继续投递，不批量改写调度时间；暂停状态持久化在 SQLite 中，重启后保持
 - **签名密钥平滑轮换**：`POST /subscriptions/{id}/rotate-secret` 原子切换订阅密钥；宽限期（0～86400 秒）内每次投递同时携带按新密钥生成的 `X-Webhook-Signature` 与按旧密钥生成的 `X-Webhook-Signature-Previous`，期满后只发新签名；宽限期内重复轮换返回 `409`，轮换状态持久化、重启后保持，重试按每次实际发送时的状态签名
 - **按订阅投递熔断器**：同一订阅连续最终失败达到 `BREAKER_FAILURE_THRESHOLD` 次即原子熔断（`open`），熔断期间事件照常入库但工作器不再领取；冷却 `BREAKER_COOLDOWN_SECONDS` 秒后仅放行最早待投递任务作为唯一 half-open 探针——成功则关闭并清零计数，失败则重新熔断并刷新冷却时间；状态持久化在 SQLite 中，重启后保持
+- **按订阅令牌桶限流**：`PUT /subscriptions/{id}/rate-limit` 设置速率策略（`rate_per_second` 补充速率 + `burst` 桶容量），工作器认领任务时在同一数据库临界区原子扣取 1 个令牌；令牌不足时任务保持 `pending` 并把 `next_attempt_at` 推迟到可计算的补充时刻，不抢占、不乱序、不丢任务；桶状态持久化在 SQLite 中，多工作器并发不会超发，重启后限流继续生效；`GET` 查询实时余额、`DELETE` 移除限流
 - **HMAC 受保护入站接口**：`POST /ingest` 使用 `INGEST_SECRET` 校验 `X-Webhook-Signature`（覆盖时间戳、ID 与原始 JSON），并强制 ±300 秒时间窗
 - **入站幂等与防重放**：已接收的 `X-Webhook-Id` 持久化在 SQLite 中；重复 ID + 相同内容返回首次接收结果且不重复投递，相同 ID 不同内容返回 `409`
 - **事件定时投递**：`POST /events` 支持可选 `deliver_at`（带时区的未来 ISO-8601 时间，如 `2026-09-20T09:00:00Z`；省略或为 `null` 表示立即投递）。计划时间持久化到任务，工作器在到点前绝不认领（无内存定时器，重启同样生效）；同订阅严格按 `task_id` 有序，因此较早的定时任务会阻塞其后的所有任务（包括立即投递的任务），直到该定时任务投递成功、最终失败或被撤销。`GET /events/{id}` 返回每个任务的 `deliver_at`；缺少时区、过去时间、非法格式均返回 `422`
@@ -69,6 +70,12 @@ curl -s -X POST http://localhost:8000/events \
   -H 'Content-Type: application/json' \
   -d "{\"event_id\": \"evt-later\", \"subscription_ids\": [\"$SID\"], \"payload\": {\"msg\": \"later\"}, \"deliver_at\": \"$LATER\"}"
 curl -s http://localhost:8000/events/evt-later   # status=pending，deliver_at 为计划时间
+
+# 限流：每秒最多 2 次投递、突发上限 5；查询实时令牌余额
+curl -s -X PUT http://localhost:8000/subscriptions/$SID/rate-limit \
+  -H 'Content-Type: application/json' \
+  -d '{"rate_per_second": 2, "burst": 5}'
+curl -s http://localhost:8000/subscriptions/$SID/rate-limit
 ```
 
 ## API 使用示例
@@ -234,7 +241,7 @@ curl -s http://localhost:8000/events/evt-001
 
 `status` 取值：`pending`（等待执行，含定时未到点）/ `in_progress`（投递中）/ `delivered`（成功）/ `failed`（最终失败）/ `cancelled`（随事件撤销，从未投递）。
 `deliver_at` 是提交时请求的计划投递时间（ISO 时间）；立即投递的任务为 `null`，定时任务即使已投递/失败/撤销也保留该值。
-`next_attempt_at` 仅在 `pending` 时有值，即下次执行时间——定时任务在到点前它等于 `deliver_at`，失败退避期间为重试到期时间。
+`next_attempt_at` 仅在 `pending` 时有值，即下次执行时间——定时任务在到点前它等于 `deliver_at`，失败退避期间为重试到期时间，限流等待令牌时为补充到 1 个令牌的时刻。
 
 事件是否被撤销过在顶层明确展示：`cancelled`（布尔，只要有一个任务为 `cancelled` 即为 `true`）与 `cancelled_at`（最近一次实际撤销动作的 ISO 时间，从未撤销为 `null`）；`counts` 给出该事件各状态任务数量（`pending` / `in_progress` / `delivered` / `failed` / `cancelled`），被撤销的任务还带有各自的 `cancelled_at`：
 
@@ -365,7 +372,58 @@ curl -s http://localhost:8000/subscriptions/44a79d7077ce
 - **探针失败（half_open → open）**：探针任务最终失败，熔断器立即重新打开，并以失败时刻为起点刷新冷却时间（`next_probe_at = 失败时刻 + BREAKER_COOLDOWN_SECONDS`）。
 - **持久化**：`state`、`consecutive_failures`、`next_probe_at` 及探针归属全部存储在 SQLite 的 `subscriptions` 表中，服务（或容器）重启后熔断状态、冷却截止时间与探针唯一性继续生效。
 
-### 9. 投递审计查询
+### 9. 按订阅限流（令牌桶）
+
+每个订阅可独立设置一个持久化令牌桶，限制该订阅的投递速率。设置或替换策略（幂等）：
+
+```bash
+curl -s -X PUT http://localhost:8000/subscriptions/44a79d7077ce/rate-limit \
+  -H 'Content-Type: application/json' \
+  -d '{"rate_per_second": 2, "burst": 5}'
+```
+
+```json
+{"subscription_id": "44a79d7077ce", "limited": true, "rate_per_second": 2.0, "burst": 5, "tokens": 5.0, "retry_after_seconds": 0.0, "updated_at": "2026-09-18T09:40:00+00:00"}
+```
+
+查询当前策略与实时令牌余额：
+
+```bash
+curl -s http://localhost:8000/subscriptions/44a79d7077ce/rate-limit
+```
+
+```json
+{"subscription_id": "44a79d7077ce", "limited": true, "rate_per_second": 2.0, "burst": 5, "tokens": 3.4, "retry_after_seconds": 0.0, "updated_at": "2026-09-18T09:40:00+00:00"}
+```
+
+移除限流（幂等，移除后投递恢复不限速）：
+
+```bash
+curl -s -X DELETE http://localhost:8000/subscriptions/44a79d7077ce/rate-limit   # 204 No Content
+```
+
+响应字段：
+
+| 字段 | 说明 |
+|------|------|
+| `limited` | 是否配置了限流策略；未配置时为 `false`，其余字段均为 `null` |
+| `rate_per_second` | 令牌补充速率（个/秒），即稳态投递速率上限 |
+| `burst` | 桶容量，即可积累的最大令牌数，也是瞬时突发上限 |
+| `tokens` | 查询时刻的实时令牌余额（按补充速率结算到当前时刻，封顶 `burst`） |
+| `retry_after_seconds` | 距凑满 1 个令牌还需等待的秒数（余额 ≥ 1 时为 `0`），与工作器推迟任务时计算的时刻一致 |
+| `updated_at` | 最近一次令牌结算（落库）的时间 |
+
+行为约定：
+
+- **认领即扣令牌**：工作器每认领一个投递任务，在同一数据库临界区内从该订阅的令牌桶原子扣取 1 个令牌（含每次失败重试的重新认领）；令牌余额与认领结果在同一事务中提交，多工作器并发不会重复扣取或超发。
+- **无令牌不抢占**：桶内不足 1 个令牌时任务**保持 `pending`**，不会被认领也不会丢失；其 `next_attempt_at` 被推迟到可计算的补充时刻 `now + (1 - tokens) / rate_per_second`，届时自动可被认领。等待期间可在 `GET /events/{id}` 看到该任务仍为 `pending` 及其下次执行时间。
+- **有序性不受影响**：被推迟的任务仍是同订阅最早的 `pending` 任务，按订阅严格有序规则继续阻塞其后续任务，投递顺序与未限流时完全一致；不同订阅的令牌桶互不影响，仍并行投递。
+- **满桶启动**：设置或替换策略时令牌桶重置为满（`tokens = burst`），即允许一次 `burst` 个的突发投递，之后按 `rate_per_second` 稳态补充；余额封顶 `burst`，不会无限积累。
+- **持久化**：策略与令牌余额存储在 SQLite 的 `subscriptions` 表中，服务（或容器）重启后限流策略、剩余令牌继续生效（结算按时间推进自动补充）；老版本数据库启动时自动迁移补齐列，存量订阅默认不限流。
+- **与其他机制正交**：暂停、熔断（含 half-open 探针）、定时投递（`deliver_at`）、事件撤销的语义不变——暂停或熔断期间不领取也就不消耗令牌；被限流推迟的 `pending` 任务可随事件正常撤销。
+- **错误码**：订阅不存在时三个端点均返回 `404`；`rate_per_second <= 0`、`burst < 1` 或类型非法返回 `422`；未配置策略时 `GET` 返回 `limited: false`（其余字段 `null`），`DELETE` 仍为 `204`。
+
+### 10. 投递审计查询
 
 跨事件、跨订阅的投递任务审计视图，只读、不影响投递行为。
 
@@ -469,6 +527,9 @@ curl -s http://localhost:8000/audit/deliveries/12
 | `POST` | `/subscriptions/{id}/pause` | 暂停订阅投递（幂等，不存在返回 404） |
 | `POST` | `/subscriptions/{id}/resume` | 恢复订阅投递（幂等，不存在返回 404） |
 | `POST` | `/subscriptions/{id}/rotate-secret` | 轮换签名密钥（宽限期双签；宽限期内重复轮换返回 409，不存在返回 404） |
+| `PUT` | `/subscriptions/{id}/rate-limit` | 设置/替换按订阅令牌桶限流策略（满桶启动，幂等，不存在返回 404） |
+| `GET` | `/subscriptions/{id}/rate-limit` | 查询限流策略与实时令牌余额（未配置时 `limited=false`，不存在返回 404） |
+| `DELETE` | `/subscriptions/{id}/rate-limit` | 移除限流策略（幂等，不存在返回 404） |
 | `DELETE` | `/subscriptions/{id}` | 删除订阅（已有任务保留历史） |
 | `GET` | `/audit/deliveries` | 投递任务审计列表（按订阅/事件/状态/UTC 时间范围过滤，游标分页，按更新时间倒序） |
 | `GET` | `/audit/deliveries/{task_id}` | 单个投递任务的完整审计视图（含全部尝试记录，不存在返回 404） |
@@ -478,7 +539,7 @@ curl -s http://localhost:8000/audit/deliveries/12
 
 同一 `subscription_id` 下的投递任务按 `tasks.id` 升序（即任务创建顺序）逐条投递，语义如下：
 
-- 较早任务处于 `pending`（含退避等待重试中、以及定时任务等待 `deliver_at` 到点）或 `in_progress`（投递中）时，同订阅的后续任务**不会被任何工作器认领**；定时任务因此会阻塞其后的立即投递任务；
+- 较早任务处于 `pending`（含退避等待重试中、定时任务等待 `deliver_at` 到点、以及限流等待令牌补充）或 `in_progress`（投递中）时，同订阅的后续任务**不会被任何工作器认领**；定时任务因此会阻塞其后的立即投递任务；
 - 较早任务到达终态——`delivered`（成功）、`failed`（重试耗尽后最终失败）或 `cancelled`（随事件撤销）——才放行同订阅的下一条任务；
 - 不同订阅之间没有顺序约束，`WORKER_COUNT` 个工作器可并行投递不同订阅的任务；
 - 约束在认领时基于 SQLite 中的持久化状态判定，因此失败重试、服务重启（含崩溃恢复）后依然有效；
@@ -523,6 +584,7 @@ def is_valid_during_rotation(new_secret: str, old_secret: str, body: bytes, head
 - **订阅暂停**：暂停只是翻转 `subscriptions.paused_at` 标记（首次暂停的时间戳，重复暂停不变），从不修改任务行。认领查询增加 `s.paused_at IS NULL` 条件，与有序约束在同一原子临界区内求值，因此暂停对已 `in_progress` 的尝试（至多 `WORKER_COUNT` 个并发）无影响、它们照常完成，而新的认领立即停摆；恢复时清除标记即可，所有 `pending` 任务保留原 `next_attempt_at` 与 `task_id` 顺序，无需任何批量更新。
 - **密钥轮换**：`subscriptions` 表新增 `previous_secret` 与 `previous_secret_expires_at` 两列（老库由启动迁移自动 `ALTER TABLE` 补齐），二者始终同时设置或同时清空。轮换在连接锁保护的单次提交中原子完成——当前密钥降级为 previous 并写入绝对失效时间，`secret` 列更新为新密钥；`grace_seconds=0` 时直接清空 previous 列。工作器每次认领任务时随连接读出当前密钥状态，构造请求头时按发送时刻判定宽限期是否结束，因此重试、重启后均按当时状态签名；宽限期未结束的再次轮换在判定阶段即被拒绝（409），不产生任何写操作。查询接口只读取失效时间戳推导 `rotating` 标志，密钥明文从不离开持久层进入响应或日志。
 - **投递熔断器**：`subscriptions` 表新增 `breaker_state`、`breaker_consecutive_failures`、`breaker_next_probe_at`、`breaker_probe_task_id` 四列（老库由启动迁移自动补齐，存量订阅初始为 `closed`/0）。任务终态（`delivered`/`failed`）与熔断器记账在 `finish_attempt` 的同一个 SQLite 事务中提交：最终失败使连续失败数加一，达到 `BREAKER_FAILURE_THRESHOLD` 即原子切为 `open` 并写入 `next_probe_at = 失败时刻 + BREAKER_COOLDOWN_SECONDS`；任意成功投递清零计数。认领查询按熔断状态过滤——`open` 且冷却未到的订阅不可认领；冷却到期后首个认领把订阅原子翻为 `half_open` 并把该任务（按订阅有序约束保证即最早待投递任务）登记为唯一探针，`half_open` 期间认领查询只允许探针任务本身通过，故多工作器并发下探针唯一；探针成功则关闭并清零，最终失败则重新 `open` 并以该失败时刻刷新冷却。全部状态持久化，重启（含崩溃恢复）后冷却计时与探针唯一性继续生效。
+- **按订阅令牌桶限流**：`subscriptions` 表新增 `rate_limit_per_second`、`rate_limit_burst`、`rate_limit_tokens`、`rate_limit_updated_at` 四列（老库由启动迁移自动补齐，四列同为 `NULL` 表示不限流）。令牌桶采用惰性结算：认领任务时在连接锁保护的同一临界区内先把余额结算到当前时刻（`tokens = min(burst, tokens + 距上次结算时长 × rate)`），余额 ≥ 1 则扣 1 个令牌并认领，扣减与任务认领在同一事务提交，故多工作器并发不会重复扣取或超发，重启后余额与策略继续有效。余额不足 1 时不认领：任务保持 `pending`，其 `next_attempt_at` 被推迟到补充时刻 `now + (1 - tokens) / rate`（结算后的余额同事务落库），认领循环随即考察下一个到期任务，其它订阅不受影响；被推迟的任务到点自然重新可被认领，无需任何进程内定时器。推迟只改调度时间不改任务相对顺序——它仍是同订阅最早的 `pending` 任务并继续阻塞后续任务，故严格有序语义在限流下完全保持。`PUT` 设置/替换策略时桶重置为满（`tokens = burst`），`DELETE` 同时清空四列恢复不限流；`GET` 按查询时刻惰性结算余额，只读不落库。
 - **崩溃恢复**：启动时将残留的 `in_progress` 任务重置为 `pending` 并立即到期；`pending` 任务按原 `next_attempt_at` 继续调度。崩溃恢复把未完成任务重新视为“尚未认领”，因此若其事件在恢复后被撤销，这些任务会随撤销终止；未撤销则照常重新投递。
 - **定时投递**：`POST /events` 的可选 `deliver_at` 在 Pydantic 模型层校验——必须是可解析的 ISO-8601 字符串、带显式时区偏移（拒绝无时区的朴素时间与纯日期）、且严格晚于当前时刻，任何不满足均返回 `422` 且不写库；通过后转换为 UTC epoch 秒。`tasks` 表新增 `deliver_at REAL` 列保存该计划时间（立即投递为 `NULL`），并在建任务时用它初始化 `next_attempt_at`，因此“到点前不认领”无需任何进程内定时器，完全由认领查询既有的 `next_attempt_at <= now` 条件保证，服务重启、崩溃恢复后同样成立。等待中的定时任务状态仍是 `pending`，认领查询既有的按订阅有序 `NOT EXISTS` 条件使其自动阻塞同订阅后续所有任务（包括立即到期的任务），直到定时任务本身进入终态；不同订阅照常并行投递。定时任务到点后的投递、失败退避、撤销、暂停恢复、熔断探针等路径与普通任务完全复用，无需特判。老库迁移：经 `cancelled` 表重建升级的最老库在重建时直接带上 `deliver_at` 列；已有 `cancelled_at` 但缺少该列的较新库通过 `ALTER TABLE tasks ADD COLUMN deliver_at REAL` 补齐，存量任务取值 `NULL`（即立即投递语义）。
 - **事件级撤销**：`tasks.status` 增加终态 `cancelled` 并新增 `cancelled_at` 列（新建库直接具备；老库启动迁移时按 SQLite 官方表重建流程——`foreign_keys=OFF`、单个显式事务内建新表、拷贝数据、DROP、RENAME、重建 `tasks` 上的两个索引——自动升级，既有任务数据原样保留）。`POST /events/{id}/cancel` 调用的 `cancel_event` 在连接锁保护的单个事务中执行：事件不存在直接返回 `None`（API 返回 `404`）；否则一条 `UPDATE ... WHERE event_id=? AND status='pending'` 原子地只撤销尚未认领的任务（写入 `cancelled_at`、清空 `next_attempt_at`/`claimed_by`），`in_progress` 与已结束任务不在 WHERE 命中范围内、结果不变；随后按状态 `GROUP BY` 计数返回。由于认领查询只选 `pending` 且有序约束只盯 `pending`/`in_progress`，撤销行既不会被重试、也不会阻塞同订阅后续任务；撤销从不经过 `finish_attempt`，故完全不触碰熔断器记账。唯一需要修复的边角是 half-open 探针在两次尝试之间回到 `pending` 时被撤销：同一事务内把该订阅熔断器从 `half_open` 转回 `open`、探针立即到期并清空探针归属，使下一个待投递任务成为替代探针，避免订阅永久卡在 half-open。重复撤销时 UPDATE 命中 0 行，响应 `cancelled=0` 且计数稳定，天然幂等；撤销与工作器认领共用同一把连接锁，并发下每个任务只可能“被认领（投递并记账）”或“被撤销”，不会重复领取也不会状态错乱。

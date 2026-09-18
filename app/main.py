@@ -25,6 +25,8 @@ from .schemas import (
     EventCreate,
     EventStatus,
     IngestEvent,
+    RateLimitOut,
+    RateLimitSet,
     SecretRotationCreate,
     SubscriptionCreate,
     SubscriptionOut,
@@ -228,6 +230,69 @@ def rotate_subscription_secret(sub_id: str, body: SecretRotationCreate) -> dict:
         raise HTTPException(409, f"a secret rotation is already in progress until {until}")
     log.info("subscription %s rotated signing secret (grace %.0fs)", sub_id, body.grace_seconds)
     return _sub_out(sub)
+
+
+# ----------------------------------------------------------------------
+# per-subscription rate limiting (token bucket)
+# ----------------------------------------------------------------------
+@app.put("/subscriptions/{sub_id}/rate-limit", response_model=RateLimitOut)
+def set_subscription_rate_limit(sub_id: str, body: RateLimitSet) -> dict:
+    """Set or replace a subscription's token-bucket rate limit (idempotent).
+
+    Every delivery-task claim on the subscription atomically spends one
+    token; tokens refill continuously at rate_per_second up to the burst
+    capacity. Setting the policy (re)starts the bucket full: tokens = burst.
+    A task that finds the bucket empty stays 'pending' and is deferred to
+    the computed refill instant; it never loses its place in the
+    subscription's delivery order.
+    """
+    result = app.state.db.set_rate_limit(sub_id, body.rate_per_second, body.burst)
+    if result is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    log.info(
+        "subscription %s rate limit set to %s token(s)/s, burst %s",
+        sub_id, body.rate_per_second, body.burst,
+    )
+    return _rate_limit_out(sub_id, result)
+
+
+@app.get("/subscriptions/{sub_id}/rate-limit", response_model=RateLimitOut)
+def get_subscription_rate_limit(sub_id: str) -> dict:
+    """Current rate-limit policy and live token balance of a subscription.
+
+    The reported balance is settled up to the query instant; with no policy
+    configured, limited is false and all bucket fields are null.
+    """
+    result = app.state.db.get_rate_limit(sub_id)
+    if result is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return _rate_limit_out(sub_id, result)
+
+
+@app.delete("/subscriptions/{sub_id}/rate-limit", status_code=204)
+def delete_subscription_rate_limit(sub_id: str) -> Response:
+    """Remove a subscription's rate limit (idempotent).
+
+    Delivery becomes unlimited again immediately; tasks previously deferred
+    for lack of tokens are claimed at their stored next_attempt_at (already
+    in the past for any waiting task, so effectively at once).
+    """
+    if not app.state.db.delete_rate_limit(sub_id):
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return Response(status_code=204)
+
+
+def _rate_limit_out(sub_id: str, status: dict) -> dict:
+    """Serialize a rate-limit status dict for the API (epoch -> ISO time)."""
+    return {
+        "subscription_id": sub_id,
+        "limited": status["limited"],
+        "rate_per_second": status["rate_per_second"],
+        "burst": status["burst"],
+        "tokens": status["tokens"],
+        "retry_after_seconds": status["retry_after_seconds"],
+        "updated_at": _iso(status["updated_at"]),
+    }
 
 
 # ----------------------------------------------------------------------

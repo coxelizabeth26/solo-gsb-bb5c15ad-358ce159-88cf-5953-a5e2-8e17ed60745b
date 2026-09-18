@@ -24,6 +24,13 @@ once too many consecutive tasks have failed permanently: while 'open' no
 task of that subscription is claimed; after the cooldown the earliest
 pending task is claimed as the single half-open probe, closing the
 breaker on success or re-opening it (with a fresh cooldown) on failure.
+
+A per-subscription token-bucket rate limit (also persisted in the DB)
+throttles claiming: every claim atomically spends one token in the same
+DB critical section, and a task that finds the bucket empty stays
+'pending' with its next_attempt_at deferred to the computed refill
+instant, so the limit holds across workers and restarts without
+disturbing the per-subscription delivery order.
 """
 from __future__ import annotations
 

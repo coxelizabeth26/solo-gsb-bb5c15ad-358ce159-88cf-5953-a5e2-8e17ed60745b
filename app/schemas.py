@@ -48,6 +48,38 @@ class SecretRotationCreate(BaseModel):
     grace_seconds: float = Field(ge=0, le=86400)
 
 
+class RateLimitSet(BaseModel):
+    """Body of PUT /subscriptions/{id}/rate-limit (token-bucket policy).
+
+    rate_per_second is the token refill rate; burst is the bucket capacity,
+    i.e. the maximum token balance a subscription can accumulate and
+    therefore the largest burst of deliveries it can start at once. Every
+    claimed delivery task costs exactly one token.
+    """
+
+    rate_per_second: float = Field(gt=0, le=1_000_000)
+    burst: int = Field(ge=1, le=1_000_000)
+
+
+class RateLimitOut(BaseModel):
+    """Rate-limit policy and live token balance of a subscription.
+
+    With no policy configured, limited is false and every other field is
+    null. Otherwise tokens is the balance settled up to the query instant
+    and retry_after_seconds the wait until one full token is available
+    (0 when the bucket already holds one) -- the same deferral a worker
+    would compute for a due task right now.
+    """
+
+    subscription_id: str
+    limited: bool
+    rate_per_second: float | None
+    burst: int | None
+    tokens: float | None
+    retry_after_seconds: float | None
+    updated_at: str | None  # last persisted token settlement (ISO time)
+
+
 class EventCreate(BaseModel):
     event_id: str = Field(min_length=1, max_length=128)
     subscription_ids: list[str] = Field(min_length=1, max_length=100)
